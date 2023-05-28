@@ -24,13 +24,17 @@ ConVar g_cvURL = null;
 ConVar g_cvEndpoint = null;
 ConVar g_cvToken = null;
 ConVar g_cvDebug = null;
+ConVar g_cvAllowUnverified;
 
 // ConVar Values
 char g_sURL[1024];
 char g_sEndpoint[1024];
 char g_sToken[64];
 bool g_bDebug = false;
+
 bool g_bLate = false;
+bool g_bAuthDown = false;
+int g_iAuthDownRemainingMinutes = 10;
 
 bool g_bResponseFailed[MAXPLAYERS + 1];
 int g_iClientGroup[MAXPLAYERS + 1];
@@ -54,8 +58,10 @@ public void OnPluginStart() {
 	g_cvEndpoint = CreateConVar("sm_gflum_endpoint", "index.php", "The Restful API endpoint. ");
 	g_cvToken = CreateConVar("sm_gflum_token", "", "The token to use when accessing the API.");
 	g_cvDebug = CreateConVar("sm_gflum_debug", "0", "Logging level increased for debugging.");
+	g_cvAllowUnverified = CreateConVar("sm_gflum_allow_unverified", "1", "Whether to allow unverified Steam ID's to get perks when authentication issues are detected.");
 
 	AutoExecConfig(true, "GFL-UserManagement");
+	CreateTimer(60.0, Timer_AuthCheck, _, TIMER_REPEAT);
 
 	if (g_bLate)
 		ValidateGroups();
@@ -133,6 +139,9 @@ public Action Timer_RebuildCache(Handle timer) {
 
 public void OnClientConnected(int client) {
 	ResetClient(client);
+
+	if (!IsFakeClient(client) && g_bAuthDown && g_cvAllowUnverified.BoolValue)
+		FetchPerks(client, false);
 }
 
 public void OnClientDisconnect(int client) {
@@ -140,24 +149,16 @@ public void OnClientDisconnect(int client) {
 }
 
 public void OnClientAuthorized(int client, const char[] sAuth2) {
-	// Get their Steam ID 64.
-	char steamID64[64];
-	GetClientAuthId(client, AuthId_SteamID64, steamID64, sizeof(steamID64), true);
+	if (g_bAuthDown)
+	{
+		if (g_bDebug && g_cvAllowUnverified.BoolValue)
+			GFLCore_LogMessage("", "[GFL-UserManagement] OnClientAuthorized() :: Working Steam authentication detected, disabling perk retrieval for unverified Steam ID's.");
 
-	// Format the GET string.
-	char path[256];
-	Format(path, sizeof(path), "%s?steamid=%s", g_sEndpoint, steamID64);
-
-	// Set authentication header.
-	httpClient.SetHeader("Authorization", g_sToken);
-
-	// Execute the GET request.
-	httpClient.Get(path, PerkJSONReceived, GetClientUserId(client));
-
-	// Debug.
-	if (g_bDebug) {
-		GFLCore_LogMessage("", "[GFL-UserManagement] OnClientAuthorized() :: Fetching perks for %L now...", client);
+		g_bAuthDown = false;
 	}
+
+	g_iAuthDownRemainingMinutes = 10;
+	FetchPerks(client, true);
 }
 
 public void PerkJSONReceived(HTTPResponse response, any userID) {
@@ -215,6 +216,15 @@ public void PerkJSONReceived(HTTPResponse response, any userID) {
 			GFLCore_LogMessage("", "[GFL-UserManagement] PerkJSONReceived() :: Received perks for %L late. Calling NotifyPostAdminCheck", client);
 		}
 		NotifyPostAdminCheck(client);
+		return;
+	}
+
+	if (g_bAuthDown && g_cvAllowUnverified.BoolValue)
+	{
+		if (g_bDebug)
+			GFLCore_LogMessage("", "[GFL-UserManagement] PerkJSONReceived() :: Manually calling AssignPerks for %L due to authentication issues.", client);
+
+		AssignPerks(client);
 	}
 }
 
@@ -238,6 +248,61 @@ public Action OnClientPreAdminCheck(int client) {
 public void OnClientPostAdminFilter(int client) {
 	if (!g_bResponseFailed[client]) {
 		AssignPerks(client);
+	}
+}
+
+Action Timer_AuthCheck(Handle timer)
+{
+	for (int client = 1; client <= MaxClients; client++)
+	{
+		if (IsClientInGame(client) && !IsFakeClient(client) && !IsClientAuthorized(client))
+		{
+			if (g_iAuthDownRemainingMinutes > 0)
+				g_iAuthDownRemainingMinutes--;
+
+			break;
+		}
+	}
+
+	if (g_iAuthDownRemainingMinutes == 0 && !g_bAuthDown)
+	{
+		if (g_cvAllowUnverified.BoolValue)
+		{
+			if (g_bDebug)
+				GFLCore_LogMessage("", "[GFL-UserManagement] Timer_AuthCheck() :: Steam authentication issues detected, enabling perk retrieval for unverified Steam ID's.");
+
+			for (int client = 1; client <= MaxClients; client++)
+			{
+				if (IsClientConnected(client) && !IsFakeClient(client) && !IsClientAuthorized(client) && GetUserAdmin(client) == INVALID_ADMIN_ID)
+					FetchPerks(client, false);
+			}
+		}
+
+		g_bAuthDown = true;
+	}
+
+	return Plugin_Continue;
+}
+
+stock void FetchPerks(int client, bool validate)
+{
+	// Get their Steam ID 64.
+	char steamID64[64];
+	GetClientAuthId(client, AuthId_SteamID64, steamID64, sizeof(steamID64), validate);
+
+	// Format the GET string.
+	char path[256];
+	Format(path, sizeof(path), "%s?steamid=%s", g_sEndpoint, steamID64);
+
+	// Set authentication header.
+	httpClient.SetHeader("Authorization", g_sToken);
+
+	// Execute the GET request.
+	httpClient.Get(path, PerkJSONReceived, GetClientUserId(client));
+
+	// Debug.
+	if (g_bDebug) {
+		GFLCore_LogMessage("", "[GFL-UserManagement] FetchPerks() :: Fetching %s perks for %L now...", validate ? "verified" : "unverified", client);
 	}
 }
 
